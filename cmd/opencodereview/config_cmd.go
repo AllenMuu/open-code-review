@@ -45,7 +45,7 @@ var configSetCmd = &cobra.Command{
 	Use:     "set <key> <value>",
 	Short:   "Set a configuration value",
 	Example: "  ocr config set llm.model claude-opus-4-6\n  ocr config set provider anthropic",
-	Args:    cobra.ExactArgs(2),
+	Args:    exactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runConfigSet(args[0], args[1])
 	},
@@ -56,7 +56,7 @@ var configUnsetCmd = &cobra.Command{
 	Short:   "Remove a configuration value",
 	Long:    "Remove a provider, custom_providers.<name>, or mcp_servers.<name>.",
 	Example: "  ocr config unset provider\n  ocr config unset custom_providers.my-provider\n  ocr config unset mcp_servers.github",
-	Args:    cobra.ExactArgs(1),
+	Args:    exactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runConfigUnset(args[0])
 	},
@@ -556,7 +556,13 @@ func applyProviderField(entry *ProviderEntry, field, key, value string) error {
 	case "api_key":
 		entry.APIKey = value
 	case "url":
-		entry.URL = value
+		trimmedURL := strings.TrimSpace(value)
+		if trimmedURL != "" {
+			if err := validateBaseURL(trimmedURL); err != nil {
+				return fmt.Errorf("invalid URL for %s: %w", key, err)
+			}
+		}
+		entry.URL = trimmedURL
 	case "protocol":
 		normalized := llm.NormalizeProtocol(value)
 		if err := llm.ValidateProtocol(normalized); err != nil {
