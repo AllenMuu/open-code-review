@@ -108,10 +108,6 @@ func splitPaths(raw string) []string {
 	return out
 }
 
-func executeScan(opts scanOptions) error {
-	return executeScanContext(context.Background(), opts)
-}
-
 func executeScanContext(ctx context.Context, opts scanOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -263,10 +259,6 @@ func loadScanResumeState(repoDir string, opts scanOptions, scanPaths []string) (
 		return nil, fmt.Errorf("resume session %q has no completed scan items (run 'ocr session list' to see available sessions)", opts.resume)
 	}
 	return state, nil
-}
-
-func runScanPreview(cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string, outputFormat string) error {
-	return runScanPreviewContext(context.Background(), cc, scanTpl, scanPaths, outputFormat)
 }
 
 func runScanPreviewContext(ctx context.Context, cc *commonContext, scanTpl *template.ScanTemplate, scanPaths []string, outputFormat string) error {
