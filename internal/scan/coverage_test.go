@@ -5,6 +5,7 @@ package scan
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -21,6 +22,7 @@ import (
 type fakeScanClient struct {
 	responses []*llm.ChatResponse
 	idx       int
+	onCall    func(int)
 }
 
 func (f *fakeScanClient) CompletionsWithCtx(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -31,8 +33,12 @@ func (f *fakeScanClient) CompletionsWithCtx(_ context.Context, _ llm.ChatRequest
 			Usage:   &llm.UsageInfo{},
 		}, nil
 	}
-	resp := f.responses[f.idx]
+	call := f.idx
+	resp := f.responses[call]
 	f.idx++
+	if f.onCall != nil {
+		f.onCall(call)
+	}
 	return resp, nil
 }
 
@@ -697,6 +703,140 @@ func TestDispatchSubtasks_ResumeSkipsCompletedFiles(t *testing.T) {
 	}
 	if info.ResumedFrom != resume.SessionID || info.ReusedFiles != 1 || info.RerunFiles != 1 || info.PreviousModel != "old-model" || info.CurrentModel != "new-model" {
 		t.Fatalf("ResumeInfo = %+v", info)
+	}
+}
+
+func TestDispatchSubtasks_CancelledRunResumesCompletedFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	repoDir := t.TempDir()
+	first := model.ScanItem{Path: "first.go", Content: "package first\n", LineCount: 1}
+	second := model.ScanItem{Path: "second.go", Content: "package second\n", LineCount: 1}
+	commentArgs := `{"path":"first.go","comments":[{"content":"first finding"}]}`
+	dedupResult := `{"groups":[{"members":["c-0"]}]}`
+	empty := ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	parentSession := session.New(repoDir, "main", "test", session.SessionOptions{
+		ReviewMode: session.ReviewModeFullScan,
+	})
+	tpl := makeTemplateWithFullScan()
+	tpl.BatchSize = 1
+	tpl.DedupMinComments = 1
+	tpl.DedupTask = &template.LlmConversation{
+		Messages: []template.ChatMessage{{Role: "user", Content: "dedup {{batch_comments}}"}},
+	}
+	client := &fakeScanClient{
+		responses: []*llm.ChatResponse{
+			{
+				Choices: []llm.Choice{
+					{Message: llm.ResponseMessage{
+						Content: &empty,
+						ToolCalls: []llm.ToolCall{{
+							ID: "comment", Type: "function", Function: llm.FunctionCall{Name: "code_comment", Arguments: commentArgs},
+						}},
+					}},
+				},
+				Usage: &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+			},
+			{
+				Choices: []llm.Choice{
+					{Message: llm.ResponseMessage{
+						Content: &empty,
+						ToolCalls: []llm.ToolCall{{
+							ID: "done", Type: "function", Function: llm.FunctionCall{Name: "task_done", Arguments: "{}"},
+						}},
+					}},
+				},
+				Usage: &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+			},
+			{
+				Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &dedupResult}}},
+				Usage:   &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+			},
+		},
+		onCall: func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		},
+	}
+	collector := tool.NewCommentCollector()
+	registry := tool.NewRegistry()
+	registry.Register(&tool.CodeCommentProvider{Collector: collector})
+	registry.Freeze()
+	parent := NewAgent(Args{
+		RepoDir:          repoDir,
+		Template:         tpl,
+		LLMClient:        client,
+		Model:            "test",
+		CommentCollector: collector,
+		Tools:            registry,
+		MainToolDefs: []llm.ToolDef{
+			{Type: "function", Function: llm.FunctionDef{Name: "code_comment"}},
+			{Type: "function", Function: llm.FunctionDef{Name: "task_done"}},
+		},
+		MaxConcurrency: 1,
+		SkipPlan:       true,
+		SkipSummary:    true,
+		Session:        parentSession,
+	})
+	parent.items = []model.ScanItem{first, second}
+	parent.currentDate = "2026-08-18"
+
+	_, err := parent.dispatchSubtasks(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dispatchSubtasks error = %v, want context.Canceled", err)
+	}
+	if err := parentSession.Finalize(); err != nil {
+		t.Fatalf("finalize parent session: %v", err)
+	}
+
+	resume, err := session.LoadResumeState(repoDir, parentSession.SessionID)
+	if err != nil {
+		t.Fatalf("load resume state: %v", err)
+	}
+	if _, ok := resume.Item(scanItemFingerprint(first)); !ok {
+		t.Fatal("completed first file is missing from the persisted resume state")
+	}
+	if _, ok := resume.Item(scanItemFingerprint(second)); ok {
+		t.Fatal("cancelled second file must not be in the persisted resume state")
+	}
+
+	resumedClient := &fakeScanClient{responses: []*llm.ChatResponse{{
+		Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &empty, ToolCalls: []llm.ToolCall{{
+			ID: "done", Type: "function", Function: llm.FunctionCall{Name: "task_done", Arguments: "{}"},
+		}}}}},
+		Usage: &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 5},
+	}}}
+	resumed := NewAgent(Args{
+		RepoDir:          repoDir,
+		Template:         makeTemplateWithFullScan(),
+		LLMClient:        resumedClient,
+		Model:            "test",
+		CommentCollector: tool.NewCommentCollector(),
+		Tools:            tool.NewRegistry(),
+		MaxConcurrency:   1,
+		SkipPlan:         true,
+		SkipDedup:        true,
+		SkipSummary:      true,
+		Resume:           resume,
+		Session: session.New(repoDir, "main", "test", session.SessionOptions{
+			ReviewMode:  session.ReviewModeFullScan,
+			ResumedFrom: resume.SessionID,
+		}),
+	})
+	resumed.items = []model.ScanItem{first, second}
+	resumed.currentDate = "2026-08-18"
+
+	if _, err := resumed.dispatchSubtasks(context.Background()); err != nil {
+		t.Fatalf("resume dispatchSubtasks: %v", err)
+	}
+	if resumedClient.idx != 1 {
+		t.Fatalf("LLM calls after resume = %d, want 1 for only the unfinished file", resumedClient.idx)
+	}
+	info := resumed.ResumeInfo()
+	if info == nil || info.ReusedFiles != 1 || info.RerunFiles != 1 {
+		t.Fatalf("resume info = %+v, want 1 reused and 1 rerun", info)
 	}
 }
 
