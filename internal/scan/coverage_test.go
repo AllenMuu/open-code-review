@@ -336,6 +336,30 @@ func TestMaybeRunProjectSummary_SkipWhenNoComments(t *testing.T) {
 	}
 }
 
+// TestMaybeRunProjectSummary_SkipWhenCancelled ensures an interrupted scan does
+// not create a summary task or send a request that the cancelled context will
+// immediately reject.
+func TestMaybeRunProjectSummary_SkipWhenCancelled(t *testing.T) {
+	tpl := makeTemplateWithFullScan()
+	tpl.ProjectSummaryTask = &template.LlmConversation{
+		Messages: []template.ChatMessage{{Role: "user", Content: "{{all_comments}}"}},
+	}
+	client := &fakeScanClient{}
+	a := newAgentForTest(t, tpl)
+	a.args.LLMClient = client
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	a.maybeRunProjectSummary(ctx, []model.LlmComment{{Path: "a.go", Content: "missing error check"}})
+
+	if client.idx != 0 {
+		t.Fatalf("summary LLM calls = %d, want 0", client.idx)
+	}
+	if _, ok := a.session.FileSessions["__scan_project_summary__"]; ok {
+		t.Fatal("cancelled summary should not create a session task record")
+	}
+}
+
 func TestMaybeRunDedup_Success(t *testing.T) {
 	dedupResp := `{"groups":[{"members":["c-0","c-1"],"merged_content":"combined finding"},{"members":["c-2"]}]}`
 	client := &fakeScanClient{
@@ -787,8 +811,18 @@ func TestDispatchSubtasks_CancelledRunResumesCompletedFiles(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("dispatchSubtasks error = %v, want context.Canceled", err)
 	}
+	// dispatchSubtasks only reports cancellation. Run owns the session terminal
+	// state before it finalizes the JSONL stream.
+	parentSession.MarkCancelled(context.Canceled)
 	if err := parentSession.Finalize(); err != nil {
 		t.Fatalf("finalize parent session: %v", err)
+	}
+	parentSummary, _, err := session.LoadDetail(repoDir, parentSession.SessionID)
+	if err != nil {
+		t.Fatalf("load cancelled parent session: %v", err)
+	}
+	if !parentSummary.Aborted || parentSummary.TerminalReason != "cancelled" || parentSummary.CancellationReason != context.Canceled.Error() {
+		t.Fatalf("cancelled parent summary = %+v", parentSummary)
 	}
 
 	resume, err := session.LoadResumeState(repoDir, parentSession.SessionID)
